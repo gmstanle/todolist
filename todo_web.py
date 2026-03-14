@@ -264,7 +264,10 @@ HTML = r"""<!doctype html>
           }
 
           const link = document.createElement('a');
-          link.href = `/files/${encodeURIComponent(markdownMatch[2])}`;
+          const target = markdownMatch[2];
+          link.href = /^https?:\/\//i.test(target)
+            ? target
+            : `/files/${encodeURIComponent(target)}`;
           link.textContent = markdownMatch[1];
           link.target = '_blank';
           link.rel = 'noreferrer noopener';
