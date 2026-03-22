@@ -8,7 +8,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote
 
-from todo_lib import add_item, move_by_index, parse_todo_file
+from todo_lib import TodoError, apply_text_command, move_by_index, parse_todo_file
 
 
 HOST = "127.0.0.1"
@@ -32,7 +32,10 @@ HTML = r"""<!doctype html>
         --line: #d8cab7;
         --accent: #b24c2f;
         --accent-soft: #f3d9d0;
+        --blocked: #8f6a2a;
+        --blocked-soft: rgba(173, 132, 53, 0.1);
         --done: #7f8a77;
+        --error: #9f2f26;
       }
 
       * {
@@ -72,7 +75,13 @@ HTML = r"""<!doctype html>
       }
 
       .subhead {
-        margin: 0 0 24px;
+        margin: 0;
+        color: var(--muted);
+      }
+
+      .form-help {
+        margin: 10px 0 24px;
+        font-size: 0.94rem;
         color: var(--muted);
       }
 
@@ -80,7 +89,6 @@ HTML = r"""<!doctype html>
         display: grid;
         grid-template-columns: 1fr auto;
         gap: 10px;
-        margin-bottom: 28px;
       }
 
       input[type="text"] {
@@ -101,6 +109,16 @@ HTML = r"""<!doctype html>
         color: white;
         background: var(--accent);
         cursor: pointer;
+      }
+
+      .feedback {
+        min-height: 1.4rem;
+        margin: 10px 0 0;
+        color: var(--muted);
+      }
+
+      .feedback[data-state="error"] {
+        color: var(--error);
       }
 
       .section-title {
@@ -143,13 +161,33 @@ HTML = r"""<!doctype html>
         background: rgba(255, 255, 255, 0.68);
       }
 
+      .blocked-item {
+        grid-template-columns: 1fr auto;
+        background: var(--blocked-soft);
+        border-color: rgba(173, 132, 53, 0.28);
+      }
+
       .done-list .item {
         color: var(--done);
         background: rgba(127, 138, 119, 0.08);
       }
 
+      .item-body {
+        min-width: 0;
+      }
+
       .item-text {
         overflow-wrap: anywhere;
+      }
+
+      .item-meta {
+        margin: 7px 0 0;
+        font-size: 0.9rem;
+        color: var(--muted);
+      }
+
+      .blocked-item .item-meta {
+        color: var(--blocked);
       }
 
       .item-text a {
@@ -158,6 +196,31 @@ HTML = r"""<!doctype html>
 
       .done-list .item-text a {
         color: inherit;
+      }
+
+      .badge {
+        display: inline-flex;
+        align-items: center;
+        padding: 3px 10px;
+        border-radius: 999px;
+        font-size: 0.8rem;
+        font-weight: 700;
+        letter-spacing: 0.03em;
+        color: var(--blocked);
+        background: rgba(173, 132, 53, 0.16);
+      }
+
+      .inline-button {
+        padding: 9px 12px;
+        border: 1px solid rgba(178, 76, 47, 0.18);
+        border-radius: 12px;
+        color: var(--accent);
+        background: rgba(255, 255, 255, 0.8);
+      }
+
+      .inline-button:disabled {
+        cursor: wait;
+        opacity: 0.7;
       }
 
       input[type="checkbox"] {
@@ -180,18 +243,32 @@ HTML = r"""<!doctype html>
     <main>
       <section class="panel">
         <h1>Todo</h1>
-        <p class="subhead">Check an active item to move it into Done. Uncheck a done item to bring it back.</p>
+        <p class="subhead">Add tasks in plain English, including blockers.</p>
+        <p class="form-help">Example: "talk to Francois before applying to any jobs". Checking off the blocker will automatically unblock anything waiting on it.</p>
 
         <form id="add-form">
-          <input id="new-item" type="text" placeholder="Add a task" autocomplete="off" required>
+          <input
+            id="new-item"
+            type="text"
+            placeholder="Add a task or dependency"
+            autocomplete="off"
+            required
+          >
           <button type="submit">Add</button>
         </form>
+        <p id="feedback" class="feedback" aria-live="polite"></p>
 
         <div class="section-title">
           <span>Active</span>
           <span class="count" id="active-count"></span>
         </div>
         <ul id="active-list"></ul>
+
+        <div class="section-title">
+          <span>Blocked</span>
+          <span class="count" id="blocked-count"></span>
+        </div>
+        <ul id="blocked-list"></ul>
 
         <div class="section-title">
           <span>Done</span>
@@ -202,11 +279,48 @@ HTML = r"""<!doctype html>
     </main>
 
     <script>
+      let feedbackTimerId = null;
+
+      function setFeedback(message = '', state = 'info') {
+        const feedback = document.getElementById('feedback');
+        feedback.textContent = message;
+        feedback.dataset.state = state;
+
+        if (feedbackTimerId !== null) {
+          window.clearTimeout(feedbackTimerId);
+          feedbackTimerId = null;
+        }
+
+        if (message) {
+          feedbackTimerId = window.setTimeout(() => {
+            feedback.textContent = '';
+            feedback.dataset.state = 'info';
+            feedbackTimerId = null;
+          }, 5000);
+        }
+      }
+
+      async function apiJson(url, options = {}) {
+        const response = await fetch(url, options);
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          throw new Error(data.error || `Request failed with status ${response.status}.`);
+        }
+        if (data.message) {
+          setFeedback(data.message);
+        }
+        return data;
+      }
+
       async function loadTodos() {
-        const response = await fetch('/api/todos');
-        const data = await response.json();
-        renderList('active', data.active);
-        renderList('done', data.done);
+        try {
+          const data = await apiJson('/api/todos');
+          renderList('active', data.active);
+          renderBlockedList(data.blocked);
+          renderList('done', data.done);
+        } catch (error) {
+          setFeedback(error.message, 'error');
+        }
       }
 
       function renderList(section, items) {
@@ -218,7 +332,9 @@ HTML = r"""<!doctype html>
         if (items.length === 0) {
           const empty = document.createElement('p');
           empty.className = 'empty';
-          empty.textContent = section === 'active' ? 'Nothing pending.' : 'Nothing completed yet.';
+          empty.textContent = section === 'active'
+            ? 'Nothing pending.'
+            : 'Nothing completed yet.';
           list.appendChild(empty);
           return;
         }
@@ -233,20 +349,93 @@ HTML = r"""<!doctype html>
           checkbox.checked = section === 'done';
           checkbox.addEventListener('change', async () => {
             checkbox.disabled = true;
-            await fetch('/api/toggle', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ section, index }),
-            });
-            await loadTodos();
+            try {
+              await apiJson('/api/toggle', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ section, index }),
+              });
+              await loadTodos();
+            } catch (error) {
+              checkbox.disabled = false;
+              setFeedback(error.message, 'error');
+            }
           });
+
+          const body = document.createElement('div');
+          body.className = 'item-body';
 
           const span = document.createElement('span');
           span.className = 'item-text';
           appendLinkedText(span, text);
+          body.appendChild(span);
 
           row.appendChild(checkbox);
-          row.appendChild(span);
+          row.appendChild(body);
+          li.appendChild(row);
+          list.appendChild(li);
+        });
+      }
+
+      function renderBlockedList(items) {
+        const list = document.getElementById('blocked-list');
+        const count = document.getElementById('blocked-count');
+        list.innerHTML = '';
+        count.textContent = `${items.length} item${items.length === 1 ? '' : 's'}`;
+
+        if (items.length === 0) {
+          const empty = document.createElement('p');
+          empty.className = 'empty';
+          empty.textContent = 'Nothing blocked right now.';
+          list.appendChild(empty);
+          return;
+        }
+
+        items.forEach((item, index) => {
+          const li = document.createElement('li');
+          const row = document.createElement('div');
+          row.className = 'item blocked-item';
+
+          const body = document.createElement('div');
+          body.className = 'item-body';
+
+          const text = document.createElement('span');
+          text.className = 'item-text';
+          appendLinkedText(text, item.text);
+
+          const meta = document.createElement('p');
+          meta.className = 'item-meta';
+          meta.textContent = 'Blocked by ';
+
+          const badge = document.createElement('span');
+          badge.className = 'badge';
+          badge.textContent = item.blocker;
+          meta.appendChild(badge);
+
+          body.appendChild(text);
+          body.appendChild(meta);
+
+          const unblockButton = document.createElement('button');
+          unblockButton.type = 'button';
+          unblockButton.className = 'inline-button';
+          unblockButton.textContent = 'Unblock';
+          unblockButton.addEventListener('click', async () => {
+            unblockButton.disabled = true;
+            try {
+              await apiJson('/api/unblock', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ index }),
+              });
+              await loadTodos();
+            } catch (error) {
+              unblockButton.disabled = false;
+              setFeedback(error.message, 'error');
+            }
+          });
+
+          row.appendChild(body);
+          row.appendChild(unblockButton);
           li.appendChild(row);
           list.appendChild(li);
         });
@@ -260,7 +449,7 @@ HTML = r"""<!doctype html>
 
         while ((markdownMatch = markdownLinkRegex.exec(text)) !== null) {
           if (markdownMatch.index > cursor) {
-            appendUrlText(container, text.slice(cursor, markdownMatch.index), urlRegex);
+            appendFormattedText(container, text.slice(cursor, markdownMatch.index), urlRegex);
           }
 
           const link = document.createElement('a');
@@ -273,6 +462,27 @@ HTML = r"""<!doctype html>
           link.rel = 'noreferrer noopener';
           container.appendChild(link);
           cursor = markdownMatch.index + markdownMatch[0].length;
+        }
+
+        if (cursor < text.length) {
+          appendFormattedText(container, text.slice(cursor), urlRegex);
+        }
+      }
+
+      function appendFormattedText(container, text, urlRegex) {
+        const boldRegex = /\*\*([^*]+)\*\*/g;
+        let cursor = 0;
+        let match;
+
+        while ((match = boldRegex.exec(text)) !== null) {
+          if (match.index > cursor) {
+            appendUrlText(container, text.slice(cursor, match.index), urlRegex);
+          }
+
+          const strong = document.createElement('strong');
+          appendUrlText(strong, match[1], urlRegex);
+          container.appendChild(strong);
+          cursor = match.index + match[0].length;
         }
 
         if (cursor < text.length) {
@@ -312,14 +522,17 @@ HTML = r"""<!doctype html>
           return;
         }
 
-        await fetch('/api/add', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ text }),
-        });
-
-        input.value = '';
-        await loadTodos();
+        try {
+          await apiJson('/api/add', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text }),
+          });
+          input.value = '';
+          await loadTodos();
+        } catch (error) {
+          setFeedback(error.message, 'error');
+        }
       });
 
       loadTodos();
@@ -356,8 +569,16 @@ class TodoHandler(BaseHTTPRequestHandler):
             self._send_html()
             return
         if self.path == "/api/todos":
-            active, done = parse_todo_file()
-            self._send_json({"active": active, "done": done})
+            active, blocked, done = parse_todo_file()
+            self._send_json(
+                {
+                    "active": [item.text for item in active],
+                    "blocked": [
+                        {"text": item.text, "blocker": item.blocker} for item in blocked
+                    ],
+                    "done": [item.text for item in done],
+                }
+            )
             return
         if self.path.startswith("/files/"):
             self._send_file(self.path.removeprefix("/files/"))
@@ -393,8 +614,8 @@ class TodoHandler(BaseHTTPRequestHandler):
                 if not text:
                     self._send_json({"error": "Text is required."}, status=400)
                     return
-                add_item(text)
-                self._send_json({"ok": True})
+                result = apply_text_command(text)
+                self._send_json({"ok": True, **result})
                 return
             if self.path == "/api/toggle":
                 section = payload.get("section")
@@ -402,10 +623,18 @@ class TodoHandler(BaseHTTPRequestHandler):
                 if section not in {"active", "done"} or not isinstance(index, int):
                     self._send_json({"error": "Invalid toggle payload."}, status=400)
                     return
-                move_by_index(section, index)
-                self._send_json({"ok": True})
+                result = move_by_index(section, index)
+                self._send_json({"ok": True, **result})
                 return
-        except (ValueError, IndexError, json.JSONDecodeError) as exc:
+            if self.path == "/api/unblock":
+                index = payload.get("index")
+                if not isinstance(index, int):
+                    self._send_json({"error": "Invalid unblock payload."}, status=400)
+                    return
+                result = move_by_index("blocked", index)
+                self._send_json({"ok": True, **result})
+                return
+        except (TodoError, ValueError, IndexError, json.JSONDecodeError) as exc:
             self._send_json({"error": str(exc)}, status=400)
             return
 
