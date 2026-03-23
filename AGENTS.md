@@ -199,7 +199,5 @@ and:
 
 ## Safety Rules
 
-- Do not infer blockers from vague priority language such as `soon`, `later`, or `after that`
 - Do not block broad sets of tasks unless the language is explicit
-- If the user says `before applying to any jobs`, block only application-submit tasks, not all job-search activity
 - If a request could reasonably match multiple categories, ask one short clarification question
